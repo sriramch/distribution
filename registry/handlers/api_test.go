@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/distribution/distribution/v3/manifest/ocischema"
-	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/distribution/distribution/v3/manifest/ocischema"
 
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/configuration"
@@ -3126,6 +3126,7 @@ func TestArtifactManifest(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to PUT manifest: %s", err)
 			}
+			defer res.Body.Close()
 			if res.StatusCode != http.StatusCreated {
 				t.Fatalf("Incorrect status code for manifest PUT: %d, expected: %d", res.StatusCode, http.StatusCreated)
 			}
@@ -3160,6 +3161,7 @@ func TestArtifactManifest(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to GET manifest: %s", err)
 			}
+			defer res.Body.Close()
 			if res.StatusCode != http.StatusNotAcceptable {
 				t.Fatalf("Incorrect status code for manifest GET: %d, expected: %d", res.StatusCode, http.StatusNotAcceptable)
 			}
@@ -3169,6 +3171,7 @@ func TestArtifactManifest(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to GET manifest: %s", err)
 			}
+			defer res.Body.Close()
 			if res.StatusCode != http.StatusOK {
 				t.Fatalf("Incorrect status code for manifest GET: %d, expected: %d", res.StatusCode, http.StatusOK)
 			}
@@ -3202,6 +3205,7 @@ func TestArtifactManifest(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Failed to DELETE subject: %s", err)
 				}
+				defer res.Body.Close()
 				if res.StatusCode != http.StatusAccepted {
 					t.Fatalf("Incorrect status code for subject DELETE: %s", err)
 				}
@@ -3230,6 +3234,7 @@ func TestArtifactManifest(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to DELETE manifest: %s", err)
 			}
+			defer res.Body.Close()
 			if res.StatusCode != http.StatusAccepted {
 				t.Fatalf("Incorrect status code for manifest DELETE: %d, expected: %d", res.StatusCode, http.StatusAccepted)
 			}
@@ -3243,6 +3248,7 @@ func TestArtifactManifest(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to GET manifest: %s", err)
 			}
+			defer res.Body.Close()
 			if res.StatusCode != http.StatusNotFound {
 				t.Fatalf("Incorrect status code for manifest GET: %d, expected: %d", res.StatusCode, http.StatusNotFound)
 			}
@@ -3324,6 +3330,7 @@ func TestDockerManifestWithSubject(t *testing.T) {
 	if res.StatusCode != http.StatusCreated {
 		t.Fatalf("Incorrect status code from manifest PUT: %d, expected: %d", res.StatusCode, http.StatusCreated)
 	}
+	defer res.Body.Close()
 
 	// TODO(brackendawson): We should now try to get referrers for the subject
 	// (which should also eventually exist for that to work), but those APIs
@@ -3476,6 +3483,7 @@ func TestArtifactManifestValidation(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to PUT manifest: %s", err)
 			}
+			defer res.Body.Close()
 			if res.StatusCode != test.wantCode {
 				t.Fatalf("Incorrect status code for manifest PUT: %d, expected: %d", res.StatusCode, test.wantCode)
 			}
