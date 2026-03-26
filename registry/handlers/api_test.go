@@ -45,7 +45,7 @@ var (
 	headerConfig = http.Header{
 		"X-Content-Type-Options": []string{"nosniff"},
 	}
-	emptyJsonDescriptor = distribution.Descriptor{
+	emptyJSONDescriptor = distribution.Descriptor{
 		MediaType: v1.DescriptorEmptyJSON.MediaType,
 		Size:      v1.DescriptorEmptyJSON.Size,
 		Digest:    v1.DescriptorEmptyJSON.Digest,
@@ -3048,7 +3048,7 @@ func TestArtifactManifest(t *testing.T) {
 				manifest, err := ocischema.FromStruct(ocischema.Manifest{
 					Versioned:    specs.Versioned{SchemaVersion: 2},
 					ArtifactType: "application/vnd.example.sbom.v1",
-					Config:       emptyJsonDescriptor,
+					Config:       emptyJSONDescriptor,
 					Subject: &distribution.Descriptor{
 						MediaType: args.mediaType,
 						Digest:    args.dgst,
@@ -3352,7 +3352,7 @@ func TestArtifactManifestValidation(t *testing.T) {
 		"layers_must_exist": {
 			config: func(t *testing.T, testEnv *testEnv, repo reference.Named) distribution.Descriptor {
 				pushScratch(t, testEnv, repo)
-				return emptyJsonDescriptor
+				return emptyJSONDescriptor
 			},
 			layers: func(t *testing.T, te *testEnv, n reference.Named) []distribution.Descriptor {
 				// a layer which has not been uploaded
@@ -3392,7 +3392,7 @@ func TestArtifactManifestValidation(t *testing.T) {
 		},
 		"config_must_exist": {
 			config: func(t *testing.T, testEnv *testEnv, repo reference.Named) distribution.Descriptor {
-				return emptyJsonDescriptor // not uploaded
+				return emptyJSONDescriptor // not uploaded
 			},
 			layers: func(t *testing.T, testEnv *testEnv, repo reference.Named) []distribution.Descriptor {
 				layers := int64(10)
@@ -3417,7 +3417,7 @@ func TestArtifactManifestValidation(t *testing.T) {
 		"valid_blobs": {
 			config: func(t *testing.T, testEnv *testEnv, repo reference.Named) distribution.Descriptor {
 				pushScratch(t, testEnv, repo)
-				return emptyJsonDescriptor
+				return emptyJSONDescriptor
 			},
 			layers: func(t *testing.T, testEnv *testEnv, repo reference.Named) []distribution.Descriptor {
 				layers := int64(10)
@@ -3519,7 +3519,7 @@ func TestReferrersAPI(t *testing.T) {
 		Versioned:    specs.Versioned{SchemaVersion: 2},
 		MediaType:    v1.MediaTypeImageManifest,
 		ArtifactType: "application/vnd.dev.sigstore.bundle.v0.3+json",
-		Config:       emptyJsonDescriptor,
+		Config:       emptyJSONDescriptor,
 		Subject: &distribution.Descriptor{
 			MediaType: v1.MediaTypeImageManifest,
 			Digest:    subjectDigest,
