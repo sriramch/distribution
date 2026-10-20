@@ -3162,8 +3162,8 @@ func TestArtifactManifest(t *testing.T) {
 				t.Fatalf("Failed to GET manifest: %s", err)
 			}
 			defer res.Body.Close()
-			if res.StatusCode != http.StatusNotAcceptable {
-				t.Fatalf("Incorrect status code for manifest GET: %d, expected: %d", res.StatusCode, http.StatusNotAcceptable)
+			if res.StatusCode != http.StatusNotFound {
+				t.Fatalf("Incorrect status code for manifest GET: %d, expected: %d", res.StatusCode, http.StatusNotFound)
 			}
 
 			req.Header.Set("Accept", contentType)

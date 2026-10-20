@@ -224,16 +224,6 @@ var (
 		the maximum allowed.`,
 		HTTPStatusCode: http.StatusBadRequest,
 	})
-
-	// ErrorCodeManifestNotAcceptable is returned when the manifest found is not
-	// acceptable according to the client's Accept header
-	ErrorCodeManifestNotAcceptable = register(errGroup, ErrorDescriptor{
-		Value:   "MANIFEST_NOT_ACCEPTABLE",
-		Message: "manifest does not match Accept header",
-		Description: `This is returned if the manifest known to the registry
-		has a different mediaType then the client's Accept header.`,
-		HTTPStatusCode: http.StatusNotAcceptable,
-	})
 )
 
 var (
