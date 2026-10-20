@@ -399,6 +399,8 @@ func TestArtifactManifest(t *testing.T) {
 			expectedArtifactType: "application/vnd.example.comment",
 		},
 		"invalid_subject": {
+			// Parse is intentionally lenient — subject field validation is in
+			// storage verifyManifest so it runs only on push, not on reads.
 			manifest: Manifest{
 				Versioned: specs.Versioned{
 					SchemaVersion: 2,
@@ -409,7 +411,7 @@ func TestArtifactManifest(t *testing.T) {
 					emptyJSONDescriptor,
 				},
 				Subject: &distribution.Descriptor{
-					MediaType: v1.MediaTypeImageLayerGzip, // The subject is a manifest
+					MediaType: v1.MediaTypeImageLayerGzip, // blob type, not a manifest
 					Size:      365,
 					Digest:    "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
 				},
@@ -417,7 +419,8 @@ func TestArtifactManifest(t *testing.T) {
 					"com.example.data": "payload",
 				},
 			},
-			expectValid: false,
+			expectValid:          true,
+			expectedArtifactType: "application/vnd.example.comment",
 		},
 		"docker_manifest_valid_as_subject": {
 			manifest: Manifest{

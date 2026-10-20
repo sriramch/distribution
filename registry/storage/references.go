@@ -32,10 +32,12 @@ type ReferenceService interface {
 	Referrers(ctx context.Context, subject digest.Digest, artifactType string) ([]v1.Descriptor, error)
 }
 
+var _ ReferenceService = &referenceHandler{}
+
 type referenceHandler struct {
 	*blobStore
 	repository distribution.Repository
-	pathFn     func(name, mediaType string, reference, artifact_subject_must_be_manifest digest.Digest) (string, error)
+	pathFn     func(name, artifactType string, referrer, subject digest.Digest) (string, error)
 }
 
 func (r *referenceHandler) Link(ctx context.Context, artifactType string, referrer, subject digest.Digest) error {
@@ -235,6 +237,6 @@ func NewReferenceEnumerator(d driver.StorageDriver, repo distribution.Repository
 }
 
 // subjectReferrerLinkPath provides the path to the subject's referrer link
-func subjectReferrerLinkPath(name, mediaType string, referrer, subject digest.Digest) (string, error) {
-	return pathFor(subjectReferrerLinkPathSpec{name: name, mediaType: mediaType, referrer: referrer, subject: subject})
+func subjectReferrerLinkPath(name, artifactType string, referrer, subject digest.Digest) (string, error) {
+	return pathFor(subjectReferrerLinkPathSpec{name: name, artifactType: artifactType, referrer: referrer, subject: subject})
 }

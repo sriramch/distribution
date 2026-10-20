@@ -127,17 +127,6 @@ func (m *DeserializedManifest) UnmarshalJSON(b []byte) error {
 		return fmt.Errorf("if config.mediaType is '%s' then artifactType must be set", v1.MediaTypeEmptyJSON)
 	}
 
-	// The subject if specified must be a manifest. This is validated here
-	// rather than in the storage manifest Put handler because the subject does
-	// not have to exist, so there is nothing to validate in the manifest store.
-	// If a non-compliant client provided the digest of a blob then this
-	// registry would still indicate that the referred manifest does not exist.
-	if mfst.Subject != nil {
-		if !distribution.ManifestMediaTypeSupported(mfst.Subject.MediaType) {
-			return fmt.Errorf("subject.mediaType must be a manifest, not '%s'", mfst.Subject.MediaType)
-		}
-	}
-
 	m.Manifest = mfst
 
 	return nil

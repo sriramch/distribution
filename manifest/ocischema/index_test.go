@@ -9,6 +9,7 @@ import (
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/manifest/schema2"
 	"github.com/opencontainers/go-digest"
+	"github.com/opencontainers/image-spec/specs-go"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -203,6 +204,106 @@ func TestIndexMediaTypes(t *testing.T) {
 	t.Run("No_MediaType", indexMediaTypeTest(v1.MediaTypeImageIndex, "", false))
 	t.Run("ImageIndex", indexMediaTypeTest(v1.MediaTypeImageIndex, v1.MediaTypeImageIndex, false))
 	t.Run("Bad_MediaType", indexMediaTypeTest(v1.MediaTypeImageIndex, v1.MediaTypeImageIndex+"XXX", true))
+}
+
+func marshalIndex(t *testing.T, idx ImageIndex) []byte {
+	t.Helper()
+	b, err := json.Marshal(idx)
+	if err != nil {
+		t.Fatalf("error marshaling ImageIndex: %v", err)
+	}
+	return b
+}
+
+func TestArtifactIndex(t *testing.T) {
+	manifests := []v1.Descriptor{
+		{
+			MediaType: v1.MediaTypeImageManifest,
+			Digest:    "sha256:1a9ec845ee94c202b2d5da74a24f0ed2058318bfa9879fa541efaecba272e86b",
+			Size:      985,
+			Platform:  &v1.Platform{Architecture: "amd64", OS: "linux"},
+		},
+	}
+
+	subject := &v1.Descriptor{
+		MediaType: v1.MediaTypeImageManifest,
+		Size:      365,
+		Digest:    "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
+	}
+
+	for name, test := range map[string]struct {
+		index                ImageIndex
+		expectValid          bool
+		expectedArtifactType string
+		expectedSubject      *v1.Descriptor
+	}{
+		// Type() must return "" for an index with no artifactType.
+		"no_artifact_type": {
+			index:                ImageIndex{Versioned: specs.Versioned{SchemaVersion: 2}, MediaType: v1.MediaTypeImageIndex, Manifests: manifests},
+			expectValid:          true,
+			expectedArtifactType: "",
+		},
+		// ArtifactType set, no subject — Type() returns the artifactType.
+		"typical_artifact": {
+			index:                ImageIndex{Versioned: specs.Versioned{SchemaVersion: 2}, MediaType: v1.MediaTypeImageIndex, ArtifactType: "application/vnd.example.sbom", Manifests: manifests},
+			expectValid:          true,
+			expectedArtifactType: "application/vnd.example.sbom",
+		},
+		// ArtifactType + valid subject both survive the serialize → UnmarshalJSON round-trip.
+		"valid_subject": {
+			index:                ImageIndex{Versioned: specs.Versioned{SchemaVersion: 2}, MediaType: v1.MediaTypeImageIndex, ArtifactType: "application/vnd.example.sig", Subject: subject, Manifests: manifests},
+			expectValid:          true,
+			expectedArtifactType: "application/vnd.example.sig",
+			expectedSubject:      subject,
+		},
+		// Parse is intentionally lenient — subject field validation is in
+		// storage verifyManifest so it runs only on push, not on reads.
+		// The invalid mediaType is preserved through the round-trip.
+		"invalid_subject": {
+			index: ImageIndex{
+				Versioned:    specs.Versioned{SchemaVersion: 2},
+				MediaType:    v1.MediaTypeImageIndex,
+				ArtifactType: "application/vnd.example.sig",
+				Subject:      &v1.Descriptor{MediaType: v1.MediaTypeImageLayerGzip, Size: 365, Digest: "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f"},
+				Manifests:    manifests,
+			},
+			expectValid:          true,
+			expectedArtifactType: "application/vnd.example.sig",
+			expectedSubject:      &v1.Descriptor{MediaType: v1.MediaTypeImageLayerGzip, Size: 365, Digest: "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			canonical := marshalIndex(t, test.index)
+
+			m, _, err := distribution.UnmarshalManifest(v1.MediaTypeImageIndex, canonical)
+			if test.expectValid != (err == nil) {
+				t.Fatalf("expectValid=%t but got err=%v", test.expectValid, err)
+			}
+			if err != nil {
+				return
+			}
+
+			referrer := m.(distribution.Referrer)
+
+			if got := referrer.Type(); got != test.expectedArtifactType {
+				t.Errorf("Type(): expected %q but got %q", test.expectedArtifactType, got)
+			}
+
+			if test.expectedSubject != nil {
+				got := referrer.Subject()
+				if got == nil {
+					t.Fatal("Subject(): expected non-nil but got nil")
+				}
+				if got.MediaType != test.expectedSubject.MediaType || got.Digest != test.expectedSubject.Digest || got.Size != test.expectedSubject.Size {
+					t.Errorf("Subject(): expected %+v but got %+v", test.expectedSubject, got)
+				}
+			} else {
+				if got := referrer.Subject(); got != nil {
+					t.Errorf("Subject(): expected nil but got %+v", got)
+				}
+			}
+		})
+	}
 }
 
 func TestValidateIndex(t *testing.T) {

@@ -3134,13 +3134,16 @@ func TestArtifactManifest(t *testing.T) {
 				t.Errorf("Incorrect Docker-Content-Digest header: %q, expected %q", res.Header.Get("Docker-Content-Digest"), ref.Digest().String())
 			}
 
-			// TODO(brackendawson): We should now try to get referrers for the subject
-			// (which should also eventually exist for that to work), but those APIs
-			// don't exist yet so for now just check the link was made.
 			referrer, ok := manifest.(distribution.Referrer)
 			if !ok {
 				t.Fatalf("Manifest should implement distribution.Referrer: %T", manifest)
 			}
+
+			// OCI-Subject header must be set to the subject digest on PUT.
+			if got, want := res.Header.Get("OCI-Subject"), referrer.Subject().Digest.String(); got != want {
+				t.Errorf("OCI-Subject header: expected %q got %q", want, got)
+			}
+
 			link, err := testEnv.app.driver.GetContent(context.Background(), fmt.Sprintf("/docker/registry/v2/repositories/%s/_manifests/revisions/sha256/%s/_referrers/_%s/sha256/%s/link",
 				repo.Name(), referrer.Subject().Digest.Hex(), url.QueryEscape(referrer.Type()), ref.Digest().Hex()))
 			if err != nil {
@@ -3210,16 +3213,25 @@ func TestArtifactManifest(t *testing.T) {
 					t.Fatalf("Incorrect status code for subject DELETE: %s", err)
 				}
 
-				// TODO(brackendawson): We should now try to get referrers for the subject
-				// (which should also eventually exist for that to work), but those APIs
-				// don't exist yet so for now just check the link still exists.
-				link, err := testEnv.app.driver.GetContent(context.Background(), fmt.Sprintf("/docker/registry/v2/repositories/%s/_manifests/revisions/sha256/%s/_referrers/_%s/sha256/%s/link",
-					repo.Name(), referrer.Subject().Digest.Hex(), url.QueryEscape(referrer.Type()), ref.Digest().Hex()))
+				// The referrer must still appear via GET /referrers even after its subject is deleted.
+				referrersURL := fmt.Sprintf("%s/v2/%s/referrers/%s", testEnv.server.URL, repo.Name(), referrer.Subject().Digest)
+				resp, err := http.Get(referrersURL)
 				if err != nil {
-					t.Fatalf("Failed to get expected referrers link from subject with error: %s", err)
+					t.Fatalf("Failed to GET referrers after subject delete: %s", err)
 				}
-				if string(link) != ref.Digest().String() {
-					t.Errorf("Subject's referrers link has incorrect content:\n%s\nexpected:\n%s", string(link), ref.Digest().String())
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					t.Fatalf("Unexpected status for referrers GET: %d, expected %d", resp.StatusCode, http.StatusOK)
+				}
+				var index v1.Index
+				if err := json.NewDecoder(resp.Body).Decode(&index); err != nil {
+					t.Fatalf("Failed to decode referrers response: %s", err)
+				}
+				if len(index.Manifests) != 1 {
+					t.Fatalf("Expected 1 referrer after subject delete, got %d", len(index.Manifests))
+				}
+				if index.Manifests[0].Digest != ref.Digest() {
+					t.Errorf("Referrer digest mismatch: got %s, expected %s", index.Manifests[0].Digest, ref.Digest())
 				}
 			}
 
@@ -3331,15 +3343,317 @@ func TestDockerManifestWithSubject(t *testing.T) {
 		t.Fatalf("Incorrect status code from manifest PUT: %d, expected: %d", res.StatusCode, http.StatusCreated)
 	}
 	defer res.Body.Close()
+	if got := res.Header.Get("OCI-Subject"); got != "" {
+		t.Errorf("OCI-Subject header must not be set for a Docker manifest, got %q", got)
+	}
 
-	// TODO(brackendawson): We should now try to get referrers for the subject
-	// (which should also eventually exist for that to work), but those APIs
-	// don't exist yet so for now just check the link was not made.
-	_, err = testEnv.app.driver.Stat(context.Background(), fmt.Sprintf("/docker/registry/v2/repositories/%s/_manifests/revisions/sha256/%s/_referrers",
-		repo.Name(), res.Header.Get("Docker-Content-Digest")))
-	var expectedErr storagedriver.InvalidPathError
-	if !errors.As(err, &expectedErr) {
-		t.Fatalf("Should have got invalid path error for referrer directory: %s", err)
+	// A Docker manifest with a spurious subject field must not appear as a referrer
+	// when the subject's referrers are queried.
+	subjectDigest := digest.Digest("sha256:118011bef6c697f7107cc0d788664a0f8c7d0316ce8d17673634155f5ecdba39")
+	referrersURL := fmt.Sprintf("%s/v2/%s/referrers/%s", testEnv.server.URL, repo.Name(), subjectDigest)
+	resp, err := http.Get(referrersURL)
+	if err != nil {
+		t.Fatalf("Failed to GET referrers: %s", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Unexpected status for referrers GET: %d, expected %d", resp.StatusCode, http.StatusOK)
+	}
+	var index v1.Index
+	if err := json.NewDecoder(resp.Body).Decode(&index); err != nil {
+		t.Fatalf("Failed to decode referrers response: %s", err)
+	}
+	if len(index.Manifests) != 0 {
+		t.Errorf("Expected no referrers for Docker manifest subject, got %d", len(index.Manifests))
+	}
+}
+
+func TestArtifactIndex(t *testing.T) {
+	// An OCI image index with a subject field must create a _referrers link
+	// under the subject digest. Mirrors TestArtifactManifest for the index type.
+	testEnv := newTestEnv(t, true)
+	defer testEnv.Shutdown()
+
+	repo, err := reference.WithName("myrepo/myindex")
+	if err != nil {
+		t.Fatalf("failed to make repo: %s", err)
+	}
+
+	// Push the empty JSON blob so the child manifest's config can be validated
+	pushScratch(t, testEnv, repo)
+
+	// Push an OCI artifact manifest as the index child.
+	childManifest, err := ocischema.FromStruct(ocischema.Manifest{
+		Versioned:    specs.Versioned{SchemaVersion: 2},
+		ArtifactType: "application/vnd.example.child",
+		Config:       emptyJSONDescriptor,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create child manifest: %s", err)
+	}
+	childContentType, childPayload, err := childManifest.Payload()
+	if err != nil {
+		t.Fatalf("Failed to get child manifest payload: %s", err)
+	}
+	childDigest := digest.FromBytes(childPayload)
+	childRef, err := reference.WithDigest(repo, childDigest)
+	if err != nil {
+		t.Fatalf("Failed to make child reference: %s", err)
+	}
+	childURL, err := testEnv.builder.BuildManifestURL(childRef)
+	if err != nil {
+		t.Fatalf("Failed to build child manifest URL: %s", err)
+	}
+	req, err := http.NewRequest(http.MethodPut, childURL, bytes.NewReader(childPayload))
+	if err != nil {
+		t.Fatalf("Failed to create child PUT request: %s", err)
+	}
+	req.Header.Set("Content-Type", childContentType)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to PUT child manifest: %s", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("Child manifest PUT: expected %d got %d", http.StatusCreated, res.StatusCode)
+	}
+
+	// Build an OCI index referrer. The referrer is dangling - the subject
+	// does not need to exist for the link to be created
+	subjectDigest := digest.Digest("sha256:ebe054f08821294feee7bc442014fdd38b4836d83781d8ba99d38eb50d0c9d85")
+	indexStruct := ocischema.ImageIndex{
+		Versioned:    specs.Versioned{SchemaVersion: 2},
+		MediaType:    v1.MediaTypeImageIndex,
+		ArtifactType: "application/vnd.example.index-sig",
+		Subject: &v1.Descriptor{
+			MediaType: v1.MediaTypeImageManifest,
+			Digest:    subjectDigest,
+			Size:      99,
+		},
+		Manifests: []v1.Descriptor{
+			{
+				MediaType: v1.MediaTypeImageManifest,
+				Digest:    childDigest,
+				Size:      int64(len(childPayload)),
+			},
+		},
+	}
+	rawIndex, err := json.Marshal(indexStruct)
+	if err != nil {
+		t.Fatalf("Failed to marshal index: %s", err)
+	}
+	indexManifest, _, err := distribution.UnmarshalManifest(v1.MediaTypeImageIndex, rawIndex)
+	if err != nil {
+		t.Fatalf("Failed to unmarshal index manifest: %s", err)
+	}
+	_, indexPayload, err := indexManifest.Payload()
+	if err != nil {
+		t.Fatalf("Failed to get index payload: %s", err)
+	}
+	indexDigest := digest.FromBytes(indexPayload)
+	indexRef, err := reference.WithDigest(repo, indexDigest)
+	if err != nil {
+		t.Fatalf("Failed to make index reference: %s", err)
+	}
+	indexURL, err := testEnv.builder.BuildManifestURL(indexRef)
+	if err != nil {
+		t.Fatalf("Failed to build index URL: %s", err)
+	}
+
+	req, err = http.NewRequest(http.MethodPut, indexURL, bytes.NewReader(indexPayload))
+	if err != nil {
+		t.Fatalf("Failed to create index PUT request: %s", err)
+	}
+	req.Header.Set("Content-Type", v1.MediaTypeImageIndex)
+
+	res, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Failed to PUT index: %s", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("Index PUT: expected %d got %d", http.StatusCreated, res.StatusCode)
+	}
+
+	// OCI-Subject header must be set to the subject digest.
+	if got, want := res.Header.Get("OCI-Subject"), subjectDigest.String(); got != want {
+		t.Errorf("OCI-Subject header: expected %q got %q", want, got)
+	}
+
+	// a _referrers link must be created under the subject digest.
+	referrer := indexManifest.(distribution.Referrer)
+	link, err := testEnv.app.driver.GetContent(context.Background(), fmt.Sprintf(
+		"/docker/registry/v2/repositories/%s/_manifests/revisions/sha256/%s/_referrers/_%s/sha256/%s/link",
+		repo.Name(), referrer.Subject().Digest.Hex(), url.QueryEscape(referrer.Type()), indexRef.Digest().Hex()))
+	if err != nil {
+		t.Fatalf("Failed to get referrers link: %s", err)
+	}
+	if string(link) != indexRef.Digest().String() {
+		t.Errorf("Referrers link content: expected %q got %q", indexRef.Digest(), string(link))
+	}
+}
+
+func TestSubjectValidation(t *testing.T) {
+	// Verifies that invalid subject descriptors are rejected with 400 on push
+	// for both OCI image manifests and OCI image indexes. Subject validation
+	// runs in verifyManifest (push only), not in UnmarshalJSON (which also runs
+	// on reads), so parse-level tests do not cover this.
+	invalidSubjectCases := map[string]distribution.Descriptor{
+		"non_manifest_mediatype": {
+			MediaType: v1.MediaTypeImageLayerGzip,
+			Digest:    "sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f",
+			Size:      99,
+		},
+		"malformed_digest": {
+			MediaType: v1.MediaTypeImageManifest,
+			Digest:    digest.Digest("not-a-valid-digest"),
+			Size:      99,
+		},
+	}
+
+	for name, subject := range invalidSubjectCases {
+		subject := subject
+		t.Run("manifest/"+name, func(t *testing.T) {
+			testEnv := newTestEnv(t, true)
+			defer testEnv.Shutdown()
+
+			repo, err := reference.WithName("test/subject-validation")
+			if err != nil {
+				t.Fatalf("failed to make repo: %s", err)
+			}
+
+			pushScratch(t, testEnv, repo)
+
+			manifest, err := ocischema.FromStruct(ocischema.Manifest{
+				Versioned:    specs.Versioned{SchemaVersion: 2},
+				ArtifactType: "application/vnd.example.sig",
+				Config:       emptyJSONDescriptor,
+				Subject:      &subject,
+			})
+			if err != nil {
+				t.Fatalf("Failed to create manifest: %s", err)
+			}
+			contentType, payload, err := manifest.Payload()
+			if err != nil {
+				t.Fatalf("Failed to get payload: %s", err)
+			}
+			ref, err := reference.WithDigest(repo, digest.FromBytes(payload))
+			if err != nil {
+				t.Fatalf("Failed to make reference: %s", err)
+			}
+			manifestURL, err := testEnv.builder.BuildManifestURL(ref)
+			if err != nil {
+				t.Fatalf("Failed to build manifest URL: %s", err)
+			}
+			req, err := http.NewRequest(http.MethodPut, manifestURL, bytes.NewReader(payload))
+			if err != nil {
+				t.Fatalf("Failed to create PUT request: %s", err)
+			}
+			req.Header.Set("Content-Type", contentType)
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Failed to PUT manifest: %s", err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusBadRequest {
+				t.Errorf("Expected 400 for invalid subject, got %d", res.StatusCode)
+			}
+		})
+
+		t.Run("index/"+name, func(t *testing.T) {
+			testEnv := newTestEnv(t, true)
+			defer testEnv.Shutdown()
+
+			repo, err := reference.WithName("test/subject-validation-index")
+			if err != nil {
+				t.Fatalf("failed to make repo: %s", err)
+			}
+
+			// Push a child manifest so the index passes child-existence validation.
+			pushScratch(t, testEnv, repo)
+			childManifest, err := ocischema.FromStruct(ocischema.Manifest{
+				Versioned:    specs.Versioned{SchemaVersion: 2},
+				ArtifactType: "application/vnd.example.child",
+				Config:       emptyJSONDescriptor,
+			})
+			if err != nil {
+				t.Fatalf("Failed to create child manifest: %s", err)
+			}
+			childContentType, childPayload, err := childManifest.Payload()
+			if err != nil {
+				t.Fatalf("Failed to get child payload: %s", err)
+			}
+			childDigest := digest.FromBytes(childPayload)
+			childRef, err := reference.WithDigest(repo, childDigest)
+			if err != nil {
+				t.Fatalf("Failed to make child reference: %s", err)
+			}
+			childURL, err := testEnv.builder.BuildManifestURL(childRef)
+			if err != nil {
+				t.Fatalf("Failed to build child URL: %s", err)
+			}
+			req, err := http.NewRequest(http.MethodPut, childURL, bytes.NewReader(childPayload))
+			if err != nil {
+				t.Fatalf("Failed to create child PUT request: %s", err)
+			}
+			req.Header.Set("Content-Type", childContentType)
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Failed to PUT child: %s", err)
+			}
+			res.Body.Close()
+			if res.StatusCode != http.StatusCreated {
+				t.Fatalf("Child PUT: expected 201 got %d", res.StatusCode)
+			}
+
+			indexStruct := ocischema.ImageIndex{
+				Versioned:    specs.Versioned{SchemaVersion: 2},
+				MediaType:    v1.MediaTypeImageIndex,
+				ArtifactType: "application/vnd.example.sig",
+				Subject:      &subject,
+				Manifests: []v1.Descriptor{
+					{
+						MediaType: v1.MediaTypeImageManifest,
+						Digest:    childDigest,
+						Size:      int64(len(childPayload)),
+					},
+				},
+			}
+			rawIndex, err := json.Marshal(indexStruct)
+			if err != nil {
+				t.Fatalf("Failed to marshal index: %s", err)
+			}
+			indexManifest, _, err := distribution.UnmarshalManifest(v1.MediaTypeImageIndex, rawIndex)
+			if err != nil {
+				t.Fatalf("Failed to unmarshal index: %s", err)
+			}
+			_, indexPayload, err := indexManifest.Payload()
+			if err != nil {
+				t.Fatalf("Failed to get index payload: %s", err)
+			}
+			indexDigest := digest.FromBytes(indexPayload)
+			indexRef, err := reference.WithDigest(repo, indexDigest)
+			if err != nil {
+				t.Fatalf("Failed to make index reference: %s", err)
+			}
+			indexURL, err := testEnv.builder.BuildManifestURL(indexRef)
+			if err != nil {
+				t.Fatalf("Failed to build index URL: %s", err)
+			}
+			req, err = http.NewRequest(http.MethodPut, indexURL, bytes.NewReader(indexPayload))
+			if err != nil {
+				t.Fatalf("Failed to create index PUT request: %s", err)
+			}
+			req.Header.Set("Content-Type", v1.MediaTypeImageIndex)
+			res, err = http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("Failed to PUT index: %s", err)
+			}
+			defer res.Body.Close()
+			if res.StatusCode != http.StatusBadRequest {
+				t.Errorf("Expected 400 for invalid subject, got %d", res.StatusCode)
+			}
+		})
 	}
 }
 
@@ -3558,6 +3872,9 @@ func TestReferrersAPI(t *testing.T) {
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusCreated {
 		t.Fatalf("unexpected status for artifact PUT: %d, expected %d", res.StatusCode, http.StatusCreated)
+	}
+	if got, want := res.Header.Get("OCI-Subject"), subjectDigest.String(); got != want {
+		t.Errorf("OCI-Subject header: expected %q got %q", want, got)
 	}
 
 	// 3. Query the referrers endpoint.

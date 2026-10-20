@@ -8,6 +8,7 @@ import (
 	"github.com/distribution/distribution/v3/internal/dcontext"
 	"github.com/distribution/distribution/v3/manifest/manifestlist"
 	"github.com/distribution/distribution/v3/manifest/ocischema"
+	"github.com/distribution/distribution/v3/registry/api/errcode"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -18,6 +19,7 @@ type manifestListHandler struct {
 	blobStore            distribution.BlobStore
 	ctx                  context.Context
 	validateImageIndexes validateImageIndexes
+	references           ReferenceService
 }
 
 var _ ManifestHandler = &manifestListHandler{}
@@ -60,6 +62,14 @@ func (ms *manifestListHandler) Put(ctx context.Context, manifestList distributio
 		return "", err
 	}
 
+	if referrer, ok := manifestList.(distribution.Referrer); ok {
+		if subject := referrer.Subject(); subject != nil {
+			if err := ms.references.Link(ctx, referrer.Type(), digest.FromBytes(payload), subject.Digest); err != nil {
+				return "", err
+			}
+		}
+	}
+
 	revision, err := ms.blobStore.Put(ctx, mt, payload)
 	if err != nil {
 		dcontext.GetLogger(ctx).Errorf("error putting payload into blobstore: %v", err)
@@ -75,6 +85,12 @@ func (ms *manifestListHandler) Put(ctx context.Context, manifestList distributio
 // consumers.
 func (ms *manifestListHandler) verifyManifest(ctx context.Context, mnfst distribution.Manifest, skipDependencyVerification bool) error {
 	var errs distribution.ErrManifestVerification
+
+	if referrer, ok := mnfst.(distribution.Referrer); ok {
+		if err := validateSubject(referrer.Subject()); err != nil {
+			return errcode.ErrorCodeManifestInvalid.WithDetail(err)
+		}
+	}
 
 	// Check if we should be validating the existence of any child images in images indexes
 	if ms.validateImageIndexes.imagesExist && !skipDependencyVerification {

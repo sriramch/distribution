@@ -106,10 +106,6 @@ func fromDescriptorsWithMediaType(descriptors []v1.Descriptor, subject *v1.Descr
 		Annotations: annotations,
 	}
 
-	if subject != nil {
-		m.ArtifactType = "application/text"
-	}
-
 	m.Manifests = make([]v1.Descriptor, len(descriptors))
 	copy(m.Manifests, descriptors)
 
@@ -183,8 +179,5 @@ func (m *DeserializedImageIndex) Subject() *distribution.Descriptor {
 
 // Type returns the artifactType of the manifest
 func (m *DeserializedImageIndex) Type() string {
-	if m.ArtifactType == "" {
-		return m.ImageIndex.MediaType
-	}
-	return m.ArtifactType
+	return m.ArtifactType // empty string when not set (indexes have no config fallback)
 }

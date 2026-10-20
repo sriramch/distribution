@@ -261,7 +261,7 @@ func pathFor(spec pathSpec) (string, error) {
 			return "", err
 		}
 
-		artifactType := "_" + url.QueryEscape(v.mediaType)
+		artifactType := "_" + url.QueryEscape(v.artifactType)
 		components, err := digestPathComponents(v.referrer, false)
 		if err != nil {
 			return "", err
@@ -468,13 +468,12 @@ type repositoriesRootPathSpec struct{}
 
 func (repositoriesRootPathSpec) pathSpec() {}
 
-// subjectReferrerLinkPathSpec returns the describes the link of a subject to
-// its referrers
+// subjectReferrerLinkPathSpec describes the link of a subject to its referrers
 type subjectReferrerLinkPathSpec struct {
-	name      string
-	referrer  digest.Digest
-	subject   digest.Digest
-	mediaType string
+	name         string
+	referrer     digest.Digest
+	subject      digest.Digest
+	artifactType string
 }
 
 func (subjectReferrerLinkPathSpec) pathSpec() {}

@@ -363,6 +363,11 @@ func (imh *manifestHandler) PutManifest(w http.ResponseWriter, r *http.Request) 
 
 	w.Header().Set("Location", location)
 	w.Header().Set("Docker-Content-Digest", imh.Digest.String())
+	if referrer, ok := manifest.(distribution.Referrer); ok {
+		if subject := referrer.Subject(); subject != nil {
+			w.Header().Set("OCI-Subject", subject.Digest.String())
+		}
+	}
 	w.WriteHeader(http.StatusCreated)
 
 	dcontext.GetLogger(imh).Debug("Succeeded in putting manifest!")

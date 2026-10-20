@@ -8,6 +8,7 @@ import (
 	"github.com/distribution/distribution/v3"
 	"github.com/distribution/distribution/v3/internal/dcontext"
 	"github.com/distribution/distribution/v3/manifest/ocischema"
+	"github.com/distribution/distribution/v3/registry/api/errcode"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -76,6 +77,10 @@ func (ms *ocischemaManifestHandler) verifyManifest(ctx context.Context, mnfst oc
 
 	if mnfst.Manifest.SchemaVersion != 2 {
 		return fmt.Errorf("unrecognized manifest schema version %d", mnfst.Manifest.SchemaVersion)
+	}
+
+	if err := validateSubject(mnfst.Manifest.Subject); err != nil {
+		return errcode.ErrorCodeManifestInvalid.WithDetail(err)
 	}
 
 	if skipDependencyVerification {
