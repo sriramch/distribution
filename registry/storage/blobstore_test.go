@@ -6,7 +6,6 @@ import (
 
 	"github.com/distribution/distribution/v3/registry/storage/cache"
 	"github.com/distribution/distribution/v3/registry/storage/cache/memory"
-	"github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
 	"github.com/opencontainers/go-digest"
 )
@@ -52,11 +51,6 @@ func TestBlobStorePutSkipsExistingContent(t *testing.T) {
 	if fi1.ModTime() != fi2.ModTime() {
 		t.Fatal("Put rewrote data that already existed")
 	}
-}
-
-func isPathNotFound(err error) bool {
-	_, ok := err.(driver.PathNotFoundError)
-	return ok
 }
 
 // TestBlobStorePutAfterGCWithStaleCache verifies that Put writes data back
