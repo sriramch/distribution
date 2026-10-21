@@ -872,3 +872,322 @@ func TestManifestStorageCache(t *testing.T) {
 		t.Errorf("Unexpected error getting cached manifest: %v", err)
 	}
 }
+
+type stubReferenceService struct {
+	unlinkCalled   bool
+	unlinkType     string
+	unlinkReferrer digest.Digest
+	unlinkSubject  digest.Digest
+	unlinkErr      error
+}
+
+func (s *stubReferenceService) Link(_ context.Context, _ string, _, _ digest.Digest) error {
+	return nil
+}
+
+func (s *stubReferenceService) Referrers(_ context.Context, _ digest.Digest, _ string) ([]v1.Descriptor, error) {
+	return nil, nil
+}
+
+func (s *stubReferenceService) Unlink(_ context.Context, mediaType string, referrer, subject digest.Digest) error {
+	s.unlinkCalled = true
+	s.unlinkType = mediaType
+	s.unlinkReferrer = referrer
+	s.unlinkSubject = subject
+	return s.unlinkErr
+}
+
+func TestManifestDeleteUnlinksReferrer(t *testing.T) {
+	repoName, _ := reference.WithName("foo/bar")
+	env := newManifestStoreTestEnv(t, repoName, "thetag",
+		BlobDescriptorCacheProvider(memory.NewInMemoryBlobDescriptorCacheProvider(memory.UnlimitedSize)),
+		EnableDelete, EnableRedirect)
+
+	ctx := context.Background()
+	msi, err := env.repository.Manifests(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ms := msi.(*manifestStore)
+	stubRefs := &stubReferenceService{}
+	ms.references = stubRefs
+
+	mfst, err := createRandomImage(t, t.Name(), v1.MediaTypeImageManifest, env.repository.Blobs(ctx))
+	if err != nil {
+		t.Fatalf("unexpected error generating random image: %v", err)
+	}
+
+	referrer := mfst.(*ocischema.DeserializedManifest)
+	subjectDigest := digest.FromBytes([]byte("subject"))
+	referrer.Manifest.Subject = &v1.Descriptor{
+		MediaType: v1.MediaTypeImageManifest,
+		Digest:    subjectDigest,
+	}
+	referrer.Manifest.ArtifactType = "application/vnd.dsse.envelope.v1+json"
+	referrer, err = ocischema.FromStruct(referrer.Manifest)
+	if err != nil {
+		t.Fatalf("unexpected error creating referrer manifest struct: %v", err)
+	}
+
+	referrerDigest, err := ms.Put(ctx, referrer)
+	if err != nil {
+		t.Fatalf("unexpected error putting referrer manifest: %v", err)
+	}
+
+	if err := ms.Delete(ctx, referrerDigest); err != nil {
+		t.Fatalf("unexpected error deleting referrer manifest: %v", err)
+	}
+
+	if !stubRefs.unlinkCalled {
+		t.Fatal("expected unlink to be called for deleted referrer")
+	}
+	if stubRefs.unlinkType != "application/vnd.dsse.envelope.v1+json" {
+		t.Fatalf("unexpected artifactType passed to unlink: %q", stubRefs.unlinkType)
+	}
+	if stubRefs.unlinkReferrer != referrerDigest {
+		t.Fatalf("unexpected referrer digest passed to unlink: %q", stubRefs.unlinkReferrer)
+	}
+	if stubRefs.unlinkSubject != subjectDigest {
+		t.Fatalf("unexpected subject digest passed to unlink: %q", stubRefs.unlinkSubject)
+	}
+}
+
+func TestManifestDeleteSkipsUnlinkForNonReferrer(t *testing.T) {
+	repoName, _ := reference.WithName("foo/bar")
+	env := newManifestStoreTestEnv(t, repoName, "thetag",
+		BlobDescriptorCacheProvider(memory.NewInMemoryBlobDescriptorCacheProvider(memory.UnlimitedSize)),
+		EnableDelete, EnableRedirect)
+
+	ctx := context.Background()
+	msi, err := env.repository.Manifests(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ms := msi.(*manifestStore)
+	stubRefs := &stubReferenceService{}
+	ms.references = stubRefs
+
+	mfst, err := createRandomImage(t, t.Name(), v1.MediaTypeImageManifest, env.repository.Blobs(ctx))
+	if err != nil {
+		t.Fatalf("unexpected error generating random image: %v", err)
+	}
+
+	mfstDigest, err := ms.Put(ctx, mfst)
+	if err != nil {
+		t.Fatalf("unexpected error putting manifest: %v", err)
+	}
+
+	if err := ms.Delete(ctx, mfstDigest); err != nil {
+		t.Fatalf("unexpected error deleting manifest: %v", err)
+	}
+
+	if stubRefs.unlinkCalled {
+		t.Fatal("did not expect unlink to be called for non-referrer manifest delete")
+	}
+}
+
+func TestManifestDeleteUnlinksReferrerIndex(t *testing.T) {
+	repoName, _ := reference.WithName("foo/bar")
+	env := newManifestStoreTestEnv(t, repoName, "thetag",
+		BlobDescriptorCacheProvider(memory.NewInMemoryBlobDescriptorCacheProvider(memory.UnlimitedSize)),
+		EnableDelete, EnableRedirect)
+
+	ctx := context.Background()
+	msi, err := env.repository.Manifests(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ms := msi.(*manifestStore)
+	stubRefs := &stubReferenceService{}
+	ms.references = stubRefs
+
+	referrerIndex, err := ocischema.FromDescriptors([]v1.Descriptor{}, nil)
+	if err != nil {
+		t.Fatalf("unexpected error creating image index: %v", err)
+	}
+
+	subjectDigest := digest.FromBytes([]byte("subject-index"))
+	referrerIndex.ImageIndex.Subject = &v1.Descriptor{
+		MediaType: v1.MediaTypeImageManifest,
+		Digest:    subjectDigest,
+	}
+	referrerIndex.ImageIndex.ArtifactType = "application/vnd.dsse.envelope.v1+json"
+
+	// Rebuild canonical JSON after mutating index fields.
+	rawIndex, err := json.Marshal(referrerIndex.ImageIndex)
+	if err != nil {
+		t.Fatalf("unexpected error marshaling image index: %v", err)
+	}
+
+	var rebuiltIndex ocischema.DeserializedImageIndex
+	if err := rebuiltIndex.UnmarshalJSON(rawIndex); err != nil {
+		t.Fatalf("unexpected error unmarshaling image index: %v", err)
+	}
+
+	referrerDigest, err := ms.Put(ctx, &rebuiltIndex)
+	if err != nil {
+		t.Fatalf("unexpected error putting referrer index: %v", err)
+	}
+
+	if err := ms.Delete(ctx, referrerDigest); err != nil {
+		t.Fatalf("unexpected error deleting referrer index: %v", err)
+	}
+
+	if !stubRefs.unlinkCalled {
+		t.Fatal("expected unlink to be called for deleted referrer index")
+	}
+
+	if stubRefs.unlinkReferrer != referrerDigest {
+		t.Fatalf("unexpected referrer digest passed to unlink: %q", stubRefs.unlinkReferrer)
+	}
+
+	if stubRefs.unlinkSubject != subjectDigest {
+		t.Fatalf("unexpected subject digest passed to unlink: %q", stubRefs.unlinkSubject)
+	}
+}
+
+func TestManifestDeleteFailsWhenUnlinkFails(t *testing.T) {
+	repoName, _ := reference.WithName("foo/bar")
+	env := newManifestStoreTestEnv(t, repoName, "thetag",
+		BlobDescriptorCacheProvider(memory.NewInMemoryBlobDescriptorCacheProvider(memory.UnlimitedSize)),
+		EnableDelete, EnableRedirect)
+
+	ctx := context.Background()
+	msi, err := env.repository.Manifests(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ms := msi.(*manifestStore)
+	unlinkErr := errors.New("storage error")
+	stubRefs := &stubReferenceService{unlinkErr: unlinkErr}
+	ms.references = stubRefs
+
+	mfst, err := createRandomImage(t, t.Name(), v1.MediaTypeImageManifest, env.repository.Blobs(ctx))
+	if err != nil {
+		t.Fatalf("unexpected error generating random image: %v", err)
+	}
+
+	referrer := mfst.(*ocischema.DeserializedManifest)
+	subjectDigest := digest.FromBytes([]byte("subject"))
+	referrer.Manifest.Subject = &v1.Descriptor{
+		MediaType: v1.MediaTypeImageManifest,
+		Digest:    subjectDigest,
+	}
+	referrer.Manifest.ArtifactType = "application/vnd.dsse.envelope.v1+json"
+	referrer, err = ocischema.FromStruct(referrer.Manifest)
+	if err != nil {
+		t.Fatalf("unexpected error creating referrer manifest struct: %v", err)
+	}
+
+	referrerDigest, err := ms.Put(ctx, referrer)
+	if err != nil {
+		t.Fatalf("unexpected error putting referrer manifest: %v", err)
+	}
+
+	err = ms.Delete(ctx, referrerDigest)
+	if err == nil {
+		t.Fatal("expected delete to fail when unlink fails")
+	}
+	if !errors.Is(err, unlinkErr) {
+		t.Fatalf("expected unlink error, got: %v", err)
+	}
+
+	if !stubRefs.unlinkCalled {
+		t.Fatal("expected unlink to be called for deleted referrer")
+	}
+
+	exists, err := ms.Exists(ctx, referrerDigest)
+	if err != nil {
+		t.Fatalf("unexpected error checking manifest existence after failed delete: %v", err)
+	}
+
+	if !exists {
+		t.Fatal("expected manifest to remain when unlink fails")
+	}
+}
+
+func TestManifestDeleteReturnsGetErrorForUnknownRevision(t *testing.T) {
+	repoName, _ := reference.WithName("foo/bar")
+	env := newManifestStoreTestEnv(t, repoName, "thetag",
+		BlobDescriptorCacheProvider(memory.NewInMemoryBlobDescriptorCacheProvider(memory.UnlimitedSize)),
+		EnableDelete, EnableRedirect)
+
+	ctx := context.Background()
+	msi, err := env.repository.Manifests(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ms := msi.(*manifestStore)
+	stubRefs := &stubReferenceService{}
+	ms.references = stubRefs
+
+	// Deleting a digest that was never created should return the manifest Get
+	// error directly.
+	missingDigest := digest.FromBytes([]byte("missing-manifest"))
+	err = ms.Delete(ctx, missingDigest)
+	if err == nil {
+		t.Fatal("expected delete to fail for missing digest")
+	}
+
+	var unknownErr distribution.ErrManifestUnknownRevision
+	if !errors.As(err, &unknownErr) {
+		t.Fatalf("expected ErrManifestUnknownRevision for missing digest delete, got: %T (%v)", err, err)
+	}
+
+	if stubRefs.unlinkCalled {
+		t.Fatal("did not expect unlink to be called when manifest is unknown")
+	}
+}
+
+func TestManifestDeleteBailsOnGetErrorNonUnknown(t *testing.T) {
+	repoName, _ := reference.WithName("foo/bar")
+	env := newManifestStoreTestEnv(t, repoName, "thetag",
+		BlobDescriptorCacheProvider(memory.NewInMemoryBlobDescriptorCacheProvider(memory.UnlimitedSize)),
+		EnableDelete, EnableRedirect)
+
+	ctx := context.Background()
+	msi, err := env.repository.Manifests(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ms := msi.(*manifestStore)
+	stubRefs := &stubReferenceService{}
+	ms.references = stubRefs
+
+	// Create a valid manifest first.
+	mfst, err := createRandomImage(t, t.Name(), v1.MediaTypeImageManifest, env.repository.Blobs(ctx))
+	if err != nil {
+		t.Fatalf("unexpected error generating random image: %v", err)
+	}
+
+	mfstDigest, err := ms.Put(ctx, mfst)
+	if err != nil {
+		t.Fatalf("unexpected error putting manifest: %v", err)
+	}
+
+	// Invalid content in underlying manifest blob so ms.Get returns a non-unknown
+	// decode/validation error
+	blobPath, err := pathFor(blobDataPathSpec{digest: mfstDigest})
+	if err != nil {
+		t.Fatalf("unexpected error building blob path: %v", err)
+	}
+	if err := env.driver.PutContent(ctx, blobPath, []byte("{}")); err != nil {
+		t.Fatalf("unexpected error corrupting manifest blob: %v", err)
+	}
+
+	err = ms.Delete(ctx, mfstDigest)
+	if err == nil {
+		t.Fatal("expected delete to fail when ms.Get returns non-unknown error")
+	}
+
+	// Since we bail out before unlink/delete, unlink should not be invoked.
+	if stubRefs.unlinkCalled {
+		t.Fatal("did not expect unlink to be called when ms.Get fails with non-unknown error")
+	}
+}

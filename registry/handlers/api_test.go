@@ -3141,8 +3141,11 @@ func TestArtifactManifest(t *testing.T) {
 			if !ok {
 				t.Fatalf("Manifest should implement distribution.Referrer: %T", manifest)
 			}
-			link, err := testEnv.app.driver.GetContent(context.Background(), fmt.Sprintf("/docker/registry/v2/repositories/%s/_manifests/revisions/sha256/%s/_referrers/_%s/sha256/%s/link",
-				repo.Name(), referrer.Subject().Digest.Hex(), url.QueryEscape(referrer.Type()), ref.Digest().Hex()))
+			// Native link path for this subject/referrer pair. We assert this exists
+			// after push and is removed after deleting the referring artifact.
+			referrerLinkPath := fmt.Sprintf("/docker/registry/v2/repositories/%s/_manifests/revisions/sha256/%s/_referrers/_%s/sha256/%s/link",
+				repo.Name(), referrer.Subject().Digest.Hex(), url.QueryEscape(referrer.Type()), ref.Digest().Hex())
+			link, err := testEnv.app.driver.GetContent(context.Background(), referrerLinkPath)
 			if err != nil {
 				t.Fatalf("Failed to get expected referrers link from subject with error: %s", err)
 			}
@@ -3213,8 +3216,7 @@ func TestArtifactManifest(t *testing.T) {
 				// TODO(brackendawson): We should now try to get referrers for the subject
 				// (which should also eventually exist for that to work), but those APIs
 				// don't exist yet so for now just check the link still exists.
-				link, err := testEnv.app.driver.GetContent(context.Background(), fmt.Sprintf("/docker/registry/v2/repositories/%s/_manifests/revisions/sha256/%s/_referrers/_%s/sha256/%s/link",
-					repo.Name(), referrer.Subject().Digest.Hex(), url.QueryEscape(referrer.Type()), ref.Digest().Hex()))
+				link, err := testEnv.app.driver.GetContent(context.Background(), referrerLinkPath)
 				if err != nil {
 					t.Fatalf("Failed to get expected referrers link from subject with error: %s", err)
 				}
@@ -3223,8 +3225,8 @@ func TestArtifactManifest(t *testing.T) {
 				}
 			}
 
-			// When an artifact manifest is DELETEd then it will not be found if you GET
-			// it. Its subject's referrer link will be left dangling.
+			// When a referring artifact manifest is DELETEd, it should not be found by
+			// GET and its native subject->referrer link should be removed.
 			req, err = http.NewRequest(http.MethodDelete, location, nil)
 			if err != nil {
 				t.Fatalf("Failed to create artifact DELETE request: %s", err)
@@ -3251,6 +3253,15 @@ func TestArtifactManifest(t *testing.T) {
 			defer res.Body.Close()
 			if res.StatusCode != http.StatusNotFound {
 				t.Fatalf("Incorrect status code for manifest GET: %d, expected: %d", res.StatusCode, http.StatusNotFound)
+			}
+
+			_, err = testEnv.app.driver.GetContent(context.Background(), referrerLinkPath)
+			if err == nil {
+				t.Fatalf("Expected subject->referrer link to be removed after artifact delete")
+			}
+			var pathErr storagedriver.PathNotFoundError
+			if !errors.As(err, &pathErr) {
+				t.Fatalf("Expected PathNotFoundError for removed subject->referrer link, got: %T (%v)", err, err)
 			}
 		})
 	}
@@ -3658,5 +3669,113 @@ func TestReferrersAPI(t *testing.T) {
 	}
 	if len(noRefIndex.Manifests) != 0 {
 		t.Errorf("expected 0 referrers, got %d", len(noRefIndex.Manifests))
+	}
+
+	// 7. Reincarnation scenario: delete subject, re-push same subject digest,
+	// and verify referrer discovery still works for that digest.
+	subjectRef, err := reference.WithDigest(repo, subjectDigest)
+	if err != nil {
+		t.Fatalf("failed to make subject reference: %s", err)
+	}
+	subjectURL, err := testEnv.builder.BuildManifestURL(subjectRef)
+	if err != nil {
+		t.Fatalf("failed to build subject manifest URL: %s", err)
+	}
+
+	deleteSubjectReq, err := http.NewRequest(http.MethodDelete, subjectURL, nil)
+	if err != nil {
+		t.Fatalf("failed to create DELETE request for subject: %s", err)
+	}
+	deleteSubjectResp, err := http.DefaultClient.Do(deleteSubjectReq)
+	if err != nil {
+		t.Fatalf("failed to DELETE subject manifest: %s", err)
+	}
+	defer deleteSubjectResp.Body.Close()
+	if deleteSubjectResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("unexpected status for subject DELETE: %d, expected %d", deleteSubjectResp.StatusCode, http.StatusAccepted)
+	}
+
+	// Re-push the same subject payload by digest so the subject is recreated
+	// with the exact same digest.
+	putSubjectReq, err := http.NewRequest(http.MethodPut, subjectURL, bytes.NewReader(subjectPayload))
+	if err != nil {
+		t.Fatalf("failed to create PUT request for subject re-push: %s", err)
+	}
+	putSubjectReq.Header.Set("Content-Type", args.mediaType)
+	putSubjectResp, err := http.DefaultClient.Do(putSubjectReq)
+	if err != nil {
+		t.Fatalf("failed to PUT subject manifest: %s", err)
+	}
+	defer putSubjectResp.Body.Close()
+	if putSubjectResp.StatusCode != http.StatusCreated {
+		t.Fatalf("unexpected status for subject re-push: %d, expected %d", putSubjectResp.StatusCode, http.StatusCreated)
+	}
+
+	resp, err = http.Get(referrersURL)
+	if err != nil {
+		t.Fatalf("failed to GET referrers after subject reincarnation: %s", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("unexpected status for referrers GET after subject reincarnation: %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	var reincarnatedIndex v1.Index
+	if err := json.NewDecoder(resp.Body).Decode(&reincarnatedIndex); err != nil {
+		t.Fatalf("failed to decode referrers response after subject reincarnation: %s", err)
+	}
+	if len(reincarnatedIndex.Manifests) != 1 {
+		t.Fatalf("expected 1 referrer after subject reincarnation, got %d", len(reincarnatedIndex.Manifests))
+	}
+	if reincarnatedIndex.Manifests[0].Digest != artifactDigest {
+		t.Fatalf("unexpected referrer digest after subject reincarnation: got %s, expected %s", reincarnatedIndex.Manifests[0].Digest, artifactDigest)
+	}
+
+	artifactType := "application/vnd.dev.sigstore.bundle.v0.3+json"
+	referrerLinkPath := fmt.Sprintf("/docker/registry/v2/repositories/%s/_manifests/revisions/sha256/%s/_referrers/_%s/sha256/%s/link",
+		repo.Name(), subjectDigest.Hex(), url.QueryEscape(artifactType), artifactDigest.Hex())
+
+	// 8. Delete the referrer manifest and verify /referrers no longer returns it
+	// and its native subject->referrer link is removed.
+	deleteReq, err := http.NewRequest(http.MethodDelete, manifestURL, nil)
+	if err != nil {
+		t.Fatalf("failed to create DELETE request for referrer: %s", err)
+	}
+
+	deleteResp, err := http.DefaultClient.Do(deleteReq)
+	if err != nil {
+		t.Fatalf("failed to DELETE referrer manifest: %s", err)
+	}
+	defer deleteResp.Body.Close()
+	if deleteResp.StatusCode != http.StatusAccepted {
+		t.Fatalf("unexpected status for referrer DELETE: %d, expected %d", deleteResp.StatusCode, http.StatusAccepted)
+	}
+
+	resp, err = http.Get(referrersURL)
+	if err != nil {
+		t.Fatalf("failed to GET referrers after delete: %s", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("unexpected status for referrers GET after delete: %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	var postDeleteIndex v1.Index
+	if err := json.NewDecoder(resp.Body).Decode(&postDeleteIndex); err != nil {
+		t.Fatalf("failed to decode referrers response after delete: %s", err)
+	}
+	if len(postDeleteIndex.Manifests) != 0 {
+		t.Fatalf("expected 0 referrers after delete, got %d", len(postDeleteIndex.Manifests))
+	}
+
+	_, err = testEnv.app.driver.GetContent(context.Background(), referrerLinkPath)
+	if err == nil {
+		t.Fatal("expected native subject->referrer link to be removed after referrer DELETE")
+	}
+	var pathErr storagedriver.PathNotFoundError
+	if !errors.As(err, &pathErr) {
+		t.Fatalf("expected PathNotFoundError for removed referrer link, got: %T (%v)", err, err)
 	}
 }

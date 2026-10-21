@@ -44,6 +44,7 @@ type manifestStore struct {
 	repository *repository
 	blobStore  *linkedBlobStore
 	ctx        context.Context
+	references ReferenceService
 
 	skipDependencyVerification bool
 
@@ -151,6 +152,40 @@ func (ms *manifestStore) Put(ctx context.Context, manifest distribution.Manifest
 // Delete removes the revision of the specified manifest.
 func (ms *manifestStore) Delete(ctx context.Context, dgst digest.Digest) error {
 	dcontext.GetLogger(ms.ctx).Debug("(*manifestStore).Delete")
+
+	// Capture subject metadata before deletion so we can remove the native
+	// subject->referrer link before deleting the manifest.
+	var (
+		subjectDigest digest.Digest
+		artifactType  string
+		hasSubject    bool
+	)
+
+	manifest, err := ms.Get(ctx, dgst)
+	if err != nil {
+		dcontext.GetLogger(ms.ctx).WithError(err).Errorf("failed to get manifest %s", dgst)
+		return err
+	}
+
+	if referrer, ok := manifest.(distribution.Referrer); ok {
+		if subject := referrer.Subject(); subject != nil {
+			hasSubject = true
+			subjectDigest = subject.Digest
+			artifactType = referrer.Type()
+		}
+	}
+
+	// Remove the native subject->referrer link before deleting the manifest.
+	// Unlink runs first so storage failures leave the manifest in place and
+	// the client can retry DELETE. Missing link paths are a no-op inside Unlink
+	// (idempotent retries). Other unlink errors fail the delete request.
+	if hasSubject {
+		if err := ms.references.Unlink(ctx, artifactType, dgst, subjectDigest); err != nil {
+			dcontext.GetLogger(ms.ctx).WithError(err).Errorf("failed to unlink referrer %s from subject %s", dgst, subjectDigest)
+			return err
+		}
+	}
+
 	return ms.blobStore.Delete(ctx, dgst)
 }
 

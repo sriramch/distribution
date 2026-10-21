@@ -24,7 +24,11 @@ type ReferrerResult struct {
 // their referrers.
 type ReferenceService interface {
 	// Link creates a link from a subject back to a referrer
-	Link(ctx context.Context, mediaType string, referrer, subject digest.Digest) error
+	Link(ctx context.Context, artifactType string, referrer, subject digest.Digest) error
+
+	// Unlink removes the native subject->referrer link. A missing link path is a
+	// no-op so retries stay idempotent; storage errors propagate to the caller.
+	Unlink(ctx context.Context, artifactType string, referrer, subject digest.Digest) error
 
 	// Referrers returns the descriptors of all manifests that reference the
 	// given subject digest. If artifactType is non-empty, results are filtered
@@ -45,6 +49,25 @@ func (r *referenceHandler) Link(ctx context.Context, artifactType string, referr
 	}
 
 	return r.blobStore.link(ctx, path, referrer)
+}
+
+// Unlink removes a native subject->referrer link entry for the given
+// (subject, artifactType, referrer) tuple. Missing link paths are a no-op so
+// delete retries remain idempotent; other errors propagate to the caller.
+func (r *referenceHandler) Unlink(ctx context.Context, artifactType string, referrer, subject digest.Digest) error {
+	path, err := r.pathFn(r.repository.Named().Name(), artifactType, referrer, subject)
+	if err != nil {
+		return err
+	}
+
+	if err := r.blobStore.driver.Delete(ctx, path); err != nil {
+		if isPathNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	return nil
 }
 
 // Referrers enumerates the _referrers directory for the given subject and
