@@ -3660,3 +3660,204 @@ func TestReferrersAPI(t *testing.T) {
 		t.Errorf("expected 0 referrers, got %d", len(noRefIndex.Manifests))
 	}
 }
+
+func TestReferrersFallbackTag(t *testing.T) {
+	testEnv := newTestEnv(t, true)
+	defer testEnv.Shutdown()
+
+	repo, err := reference.WithName("test/referrers-fallback")
+	if err != nil {
+		t.Fatalf("failed to make repo: %s", err)
+	}
+
+	args := testManifestAPISchema2(t, testEnv, repo, "subject-tag")
+	_, subjectPayload, err := args.manifest.Payload()
+	if err != nil {
+		t.Fatalf("failed to get subject payload: %s", err)
+	}
+	subjectDigest := digest.FromBytes(subjectPayload)
+	pushScratch(t, testEnv, repo)
+
+	put := func(ref string, mediaType string, payload []byte) {
+		t.Helper()
+		u, err := testEnv.builder.BuildManifestURL(mustReference(t, repo, ref))
+		if err != nil {
+			t.Fatalf("failed to build manifest URL: %s", err)
+		}
+		req, err := http.NewRequest(http.MethodPut, u, bytes.NewReader(payload))
+		if err != nil {
+			t.Fatalf("failed to create PUT request: %s", err)
+		}
+		req.Header.Set("Content-Type", mediaType)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("failed to PUT %s: %s", ref, err)
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(res.Body)
+			t.Fatalf("unexpected status for PUT %s: %d, body: %s", ref, res.StatusCode, body)
+		}
+	}
+	referrer := func(artifactType string) (v1.Descriptor, []byte) {
+		t.Helper()
+		m, err := ocischema.FromStruct(ocischema.Manifest{
+			Versioned:    specs.Versioned{SchemaVersion: 2},
+			MediaType:    v1.MediaTypeImageManifest,
+			ArtifactType: artifactType,
+			Config:       emptyJSONDescriptor,
+			Subject: &distribution.Descriptor{
+				MediaType: v1.MediaTypeImageManifest,
+				Digest:    subjectDigest,
+				Size:      int64(len(subjectPayload)),
+			},
+		})
+		if err != nil {
+			t.Fatalf("failed to create referrer manifest: %s", err)
+		}
+		_, payload, err := m.Payload()
+		if err != nil {
+			t.Fatalf("failed to get referrer payload: %s", err)
+		}
+		return v1.Descriptor{
+			MediaType:    v1.MediaTypeImageManifest,
+			ArtifactType: artifactType,
+			Digest:       digest.FromBytes(payload),
+			Size:         int64(len(payload)),
+			Annotations:  map[string]string{"source": "fallback"},
+		}, payload
+	}
+	list := func(subject digest.Digest, query string) []v1.Descriptor {
+		t.Helper()
+		resp, err := http.Get(fmt.Sprintf("%s/v2/%s/referrers/%s%s", testEnv.server.URL, repo.Name(), subject, query))
+		if err != nil {
+			t.Fatalf("failed to GET referrers: %s", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("unexpected status for referrers GET: %d, body: %s", resp.StatusCode, body)
+		}
+		var index v1.Index
+		if err := json.NewDecoder(resp.Body).Decode(&index); err != nil {
+			t.Fatalf("failed to decode referrers response: %s", err)
+		}
+		return index.Manifests
+	}
+
+	const nativeType = "application/vnd.example.native"
+	const legacyType = "application/vnd.example.legacy"
+
+	// A native referrer, which is also listed in the fallback index.
+	nativeDesc, nativePayload := referrer(nativeType)
+	put(nativeDesc.Digest.String(), v1.MediaTypeImageManifest, nativePayload)
+
+	// A referrer that predates native links: stored, but without a link under
+	// the subject.
+	legacyDesc, legacyPayload := referrer(legacyType)
+	put(legacyDesc.Digest.String(), v1.MediaTypeImageManifest, legacyPayload)
+	unlink := func(desc v1.Descriptor) {
+		t.Helper()
+		linkPath := fmt.Sprintf("/docker/registry/v2/repositories/%s/_manifests/revisions/sha256/%s/_referrers/_%s/sha256/%s/link",
+			repo.Name(), subjectDigest.Hex(), url.QueryEscape(desc.ArtifactType), desc.Digest.Hex())
+		if err := testEnv.app.driver.Delete(context.Background(), linkPath); err != nil {
+			t.Fatalf("failed to remove native link: %s", err)
+		}
+	}
+	unlink(legacyDesc)
+
+	// A referrer that is listed in the fallback index but deleted afterwards.
+	staleDesc, stalePayload := referrer("application/vnd.example.stale")
+	put(staleDesc.Digest.String(), v1.MediaTypeImageManifest, stalePayload)
+	unlink(staleDesc)
+
+	// Before the fallback tag is written there is only the native referrer.
+	if got := list(subjectDigest, ""); len(got) != 1 || got[0].Digest != nativeDesc.Digest {
+		t.Fatalf("expected only the native referrer, got %+v", got)
+	}
+
+	fallbackIndex, err := json.Marshal(v1.Index{
+		Versioned: specs.Versioned{SchemaVersion: 2},
+		MediaType: v1.MediaTypeImageIndex,
+		Manifests: []v1.Descriptor{legacyDesc, nativeDesc, staleDesc},
+	})
+	if err != nil {
+		t.Fatalf("failed to marshal fallback index: %s", err)
+	}
+	fallbackTag := subjectDigest.Algorithm().String() + "-" + subjectDigest.Encoded()
+	put(fallbackTag, v1.MediaTypeImageIndex, fallbackIndex)
+
+	staleURL, err := testEnv.builder.BuildManifestURL(mustReference(t, repo, staleDesc.Digest.String()))
+	if err != nil {
+		t.Fatalf("failed to build manifest URL: %s", err)
+	}
+	req, err := http.NewRequest(http.MethodDelete, staleURL, nil)
+	if err != nil {
+		t.Fatalf("failed to create DELETE request: %s", err)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to DELETE stale referrer: %s", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusAccepted {
+		t.Fatalf("unexpected status for DELETE: %d, expected %d", res.StatusCode, http.StatusAccepted)
+	}
+
+	// Native referrer once, then the fallback-only referrer as the client wrote it;
+	// the entry for the deleted manifest is dropped.
+	got := list(subjectDigest, "")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 referrers, got %+v", got)
+	}
+	if got[0].Digest != nativeDesc.Digest || got[0].Annotations != nil {
+		t.Errorf("expected the native entry first and hydrated from its manifest, got %+v", got[0])
+	}
+	if got[1].Digest != legacyDesc.Digest || got[1].ArtifactType != legacyType || got[1].Annotations["source"] != "fallback" {
+		t.Errorf("expected the fallback descriptor as written, got %+v", got[1])
+	}
+
+	// The artifactType filter applies to both sources.
+	if got := list(subjectDigest, "?artifactType="+url.QueryEscape(legacyType)); len(got) != 1 || got[0].Digest != legacyDesc.Digest {
+		t.Errorf("expected only the fallback referrer for %q, got %+v", legacyType, got)
+	}
+	if got := list(subjectDigest, "?artifactType="+url.QueryEscape(nativeType)); len(got) != 1 || got[0].Digest != nativeDesc.Digest {
+		t.Errorf("expected only the native referrer for %q, got %+v", nativeType, got)
+	}
+
+	// Pushing the fallback-only referrer again links it natively. It is then in
+	// both sources and still listed once, now hydrated from its manifest.
+	put(legacyDesc.Digest.String(), v1.MediaTypeImageManifest, legacyPayload)
+	got = list(subjectDigest, "")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 referrers after re-push, got %+v", got)
+	}
+	for _, desc := range got {
+		if desc.Digest == legacyDesc.Digest && desc.Annotations != nil {
+			t.Errorf("expected the re-pushed referrer to be the native entry, got %+v", desc)
+		}
+	}
+
+	// A fallback tag that is not an image index is ignored.
+	otherDigest := digest.FromString("other subject")
+	put(otherDigest.Algorithm().String()+"-"+otherDigest.Encoded(), schema2.MediaTypeManifest, subjectPayload)
+	if got := list(otherDigest, ""); len(got) != 0 {
+		t.Errorf("expected no referrers for an invalid fallback tag, got %+v", got)
+	}
+}
+
+func mustReference(t *testing.T, repo reference.Named, ref string) reference.Named {
+	t.Helper()
+	if dgst, err := digest.Parse(ref); err == nil {
+		r, err := reference.WithDigest(repo, dgst)
+		if err != nil {
+			t.Fatalf("failed to make reference: %s", err)
+		}
+		return r
+	}
+	r, err := reference.WithTag(repo, ref)
+	if err != nil {
+		t.Fatalf("failed to make reference: %s", err)
+	}
+	return r
+}

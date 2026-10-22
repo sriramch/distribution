@@ -3,12 +3,14 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"path"
 	"strings"
 
 	"github.com/distribution/distribution/v3"
+	"github.com/distribution/distribution/v3/internal/dcontext"
 	"github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
@@ -47,11 +49,24 @@ func (r *referenceHandler) Link(ctx context.Context, artifactType string, referr
 	return r.blobStore.link(ctx, path, referrer)
 }
 
-// Referrers enumerates the _referrers directory for the given subject and
+// Referrers returns the descriptors of the manifests that refer to the subject:
+// those linked natively under the subject, followed by those only listed in the
+// subject's OCI fallback referrers tag (see fallbackReferrers). A referrer
+// present in both sources is returned once, as the native entry.
+func (r *referenceHandler) Referrers(ctx context.Context, subject digest.Digest, artifactType string) ([]v1.Descriptor, error) {
+	descriptors, err := r.nativeReferrers(ctx, subject, artifactType)
+	if err != nil {
+		return nil, err
+	}
+
+	return r.fallbackReferrers(ctx, subject, artifactType, descriptors)
+}
+
+// nativeReferrers enumerates the _referrers directory for the given subject and
 // returns a descriptor for each linked manifest. The storage layout is:
 //
 //	<repo>/_manifests/revisions/<subject-alg>/<subject-hex>/_referrers/_<artifactType>/<ref-alg>/<ref-hex>/link
-func (r *referenceHandler) Referrers(ctx context.Context, subject digest.Digest, artifactType string) ([]v1.Descriptor, error) {
+func (r *referenceHandler) nativeReferrers(ctx context.Context, subject digest.Digest, artifactType string) ([]v1.Descriptor, error) {
 	name := r.repository.Named().Name()
 
 	// Build the base path: <repo>/_manifests/revisions/<subject>/_referrers/
@@ -158,6 +173,126 @@ func enumerateReferrerLinks(ctx context.Context, bs *blobStore, typeDir, artifac
 	}
 
 	return nil
+}
+
+// fallbackReferrers appends to descriptors the entries of the subject's OCI
+// fallback referrers tag, <algorithm>-<hex>, which clients maintained as an image
+// index before the referrers API existed. The spec requires a registry that
+// supports the API to keep listing them. The descriptors are client-authored and
+// already complete, so they are returned as written.
+//
+// An entry is skipped if it has an invalid digest, does not match artifactType,
+// is already in descriptors, or names a manifest that is no longer in the
+// repository. A missing or unusable fallback tag contributes nothing.
+func (r *referenceHandler) fallbackReferrers(ctx context.Context, subject digest.Digest, artifactType string, descriptors []v1.Descriptor) ([]v1.Descriptor, error) {
+	tag := referrersTag(subject)
+	index, err := r.fallbackIndex(ctx, tag)
+	if err != nil {
+		if errors.As(err, new(fallbackIndexInvalidError)) {
+			dcontext.GetLogger(ctx).WithError(err).Warnf("cannot use fallback tag %s for subject %s; skipping fallback merge", tag, subject)
+			return descriptors, nil
+		}
+		return nil, err
+	}
+	if index == nil {
+		return descriptors, nil
+	}
+
+	manifests, err := r.repository.Manifests(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := make(map[digest.Digest]struct{}, len(descriptors))
+	for _, desc := range descriptors {
+		seen[desc.Digest] = struct{}{}
+	}
+
+	for _, desc := range index.Manifests {
+		if artifactType != "" && desc.ArtifactType != artifactType {
+			continue
+		}
+		if err := desc.Digest.Validate(); err != nil {
+			dcontext.GetLogger(ctx).WithError(err).Warnf("skipping fallback referrer with invalid digest in tag %s", tag)
+			continue
+		}
+		if _, ok := seen[desc.Digest]; ok {
+			continue
+		}
+
+		exists, err := manifests.Exists(ctx, desc.Digest)
+		if err != nil {
+			return nil, fmt.Errorf("checking fallback referrer %s: %w", desc.Digest, err)
+		}
+		if !exists {
+			continue
+		}
+
+		seen[desc.Digest] = struct{}{}
+		descriptors = append(descriptors, desc)
+	}
+
+	return descriptors, nil
+}
+
+type fallbackIndexInvalidError struct{ err error }
+
+func (err fallbackIndexInvalidError) Error() string { return err.err.Error() }
+func (err fallbackIndexInvalidError) Unwrap() error { return err.err }
+
+// fallbackIndex reads the image index that the tag currently resolves to. A
+// missing tag returns a nil index. Content that is not a valid image index
+// returns a fallbackIndexInvalidError, since the index is client-managed.
+func (r *referenceHandler) fallbackIndex(ctx context.Context, tag string) (*v1.Index, error) {
+	currentPath, err := pathFor(manifestTagCurrentPathSpec{name: r.repository.Named().Name(), tag: tag})
+	if err != nil {
+		return nil, err
+	}
+
+	indexDigest, err := r.blobStore.readlink(ctx, currentPath)
+	if err != nil {
+		if isPathNotFound(err) {
+			return nil, nil
+		}
+		if errors.Is(err, digest.ErrDigestInvalidFormat) ||
+			errors.Is(err, digest.ErrDigestInvalidLength) ||
+			errors.Is(err, digest.ErrDigestUnsupported) {
+			return nil, fallbackIndexInvalidError{err: fmt.Errorf("fallback tag %s has invalid current link: %w", tag, err)}
+		}
+		return nil, fmt.Errorf("resolving fallback tag %q: %w", tag, err)
+	}
+
+	blobPath, err := pathFor(blobDataPathSpec{digest: indexDigest})
+	if err != nil {
+		return nil, err
+	}
+	content, err := r.blobStore.driver.GetContent(ctx, blobPath)
+	if err != nil {
+		if isPathNotFound(err) {
+			return nil, fallbackIndexInvalidError{err: fmt.Errorf("fallback tag %s points to missing index blob %s", tag, indexDigest)}
+		}
+		return nil, fmt.Errorf("reading fallback index blob %s: %w", indexDigest, err)
+	}
+
+	var index v1.Index
+	if err := json.Unmarshal(content, &index); err != nil {
+		return nil, fallbackIndexInvalidError{err: fmt.Errorf("decoding fallback index %s: %w", indexDigest, err)}
+	}
+	if index.SchemaVersion != 2 || index.Manifests == nil || (index.MediaType != "" && index.MediaType != v1.MediaTypeImageIndex) {
+		return nil, fallbackIndexInvalidError{err: fmt.Errorf("fallback tag %s points to invalid OCI image index %s (schemaVersion=%d mediaType=%q)", tag, indexDigest, index.SchemaVersion, index.MediaType)}
+	}
+
+	return &index, nil
+}
+
+// referrersTag returns the OCI fallback referrers tag for a subject digest:
+// <algorithm>-<hex>, with the hex truncated to 64 characters.
+func referrersTag(subject digest.Digest) string {
+	encoded := subject.Encoded()
+	if len(encoded) > 64 {
+		encoded = encoded[:64]
+	}
+	return subject.Algorithm().String() + "-" + encoded
 }
 
 // manifestEnvelope is a minimal struct for extracting mediaType, artifactType,
